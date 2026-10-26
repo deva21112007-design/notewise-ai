@@ -1,0 +1,3 @@
+# Streamlit Community Cloud — system-level dependencies
+# (needed by PyMuPDF for PDF parsing)
+libmupdf-dev
