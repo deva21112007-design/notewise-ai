@@ -61,7 +61,7 @@ def _ocr_image_bytes(image_bytes: bytes, api_key: str, page_label: str = "page")
 
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-3.8-flash",
         contents=[
             types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
             types.Part.from_text(
@@ -243,7 +243,7 @@ def extract_text_from_image(image_path, api_key: str) -> list[dict]:
 
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-3.8-flash",
         contents=[
             types.Part.from_bytes(data=img_bytes, mime_type=mime_type),
             types.Part.from_text(

@@ -37,7 +37,7 @@ from vector_store import (
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 HISTORY_WINDOW = 8          # turns kept in the prompt context
 TOP_K_PASSAGES = 6          # passages retrieved per question
 
