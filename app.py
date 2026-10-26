@@ -16,7 +16,6 @@ Improvements in this version
 
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 import streamlit as st
@@ -34,6 +33,7 @@ from vector_store import (
     DB_PATH,
     MODEL_NAME,
     COLLECTION_NAME,
+    SUPPORTED_EXTENSIONS,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -203,22 +203,25 @@ def load_existing_index():
     return collection, model
 
 
-def index_uploaded_pdf(uploaded_file):
-    """Save upload to a temp file, run build_index, return (collection, model)."""
-    with tempfile.NamedTemporaryFile(
-        delete=False, suffix=".pdf", dir=ROOT_DIR / "data"
-    ) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        tmp_path = Path(tmp.name)
+def index_uploaded_file(uploaded_file, api_key: str):
+    """Save the upload to disk, run build_index (with OCR if needed), return (collection, model)."""
+    data_dir = ROOT_DIR / "data"
+    data_dir.mkdir(exist_ok=True)
 
-    # Rename to the original filename for cleaner source citations.
-    final_path = ROOT_DIR / "data" / uploaded_file.name
-    tmp_path.rename(final_path)
+    dest_path = data_dir / uploaded_file.name
+    dest_path.write_bytes(uploaded_file.getbuffer())
 
-    with st.spinner("⚙️ Indexing your PDF — this takes ~30 seconds..."):
-        collection, model = build_index(final_path)
+    ext = dest_path.suffix.lower()
+    is_image_or_scan = ext in {".png", ".jpg", ".jpeg", ".webp"}
+    spinner_msg = (
+        "⚙️ Running OCR on your document — this may take 1–2 minutes..."
+        if is_image_or_scan
+        else "⚙️ Indexing your document — this takes ~30 seconds..."
+    )
 
-    # Clear the cached resource so the new collection is picked up.
+    with st.spinner(spinner_msg):
+        collection, model = build_index(dest_path, api_key=api_key)
+
     load_existing_index.clear()
     return collection, model
 
@@ -318,17 +321,20 @@ with st.sidebar:
 
     # ── PDF Upload ──
     st.markdown("### 📄 Upload Your Notes")
+
+    accepted_types = ["pdf", "docx", "pptx", "txt", "png", "jpg", "jpeg", "webp"]
     uploaded = st.file_uploader(
-        "Drop a PDF here",
-        type=["pdf"],
-        help="Your PDF is indexed locally — nothing is sent to external servers except the Gemini API.",
+        "Drop a file here",
+        type=accepted_types,
+        help="Supports PDF (text & scanned), Word, PowerPoint, TXT, and images. Scanned PDFs are read using Gemini Vision OCR.",
         label_visibility="collapsed",
     )
+    st.caption("📎 PDF · DOCX · PPTX · TXT · PNG · JPG · WEBP")
 
     if uploaded:
         if uploaded.name != st.session_state.doc_name:
             try:
-                col, mdl = index_uploaded_pdf(uploaded)
+                col, mdl = index_uploaded_file(uploaded, api_key=api_key)
                 st.session_state.collection = col
                 st.session_state.embed_model = mdl
                 st.session_state.doc_name = uploaded.name
@@ -336,7 +342,7 @@ with st.sidebar:
                 st.success(f"✅ Indexed **{uploaded.name}**")
                 st.rerun()
             except Exception as e:
-                st.error(f"Failed to index PDF: {e}")
+                st.error(f"Failed to index file: {e}")
 
     # ── Try loading pre-built index if no upload yet ──
     if st.session_state.collection is None:

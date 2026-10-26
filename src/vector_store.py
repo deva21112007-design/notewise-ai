@@ -4,7 +4,7 @@ from pathlib import Path
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-from document_processor import extract_text_from_pdf
+from document_processor import extract_text, SUPPORTED_EXTENSIONS
 from chunker import chunk_pages
 
 # ── Project settings ────────────────────────────────────────────────────────
@@ -19,16 +19,20 @@ RELEVANCE_THRESHOLD = 0.65
 
 
 # ── Indexing ─────────────────────────────────────────────────────────────────
-def build_index(pdf_path):
-    """Extract, chunk, embed, and store a PDF in ChromaDB."""
-    print("\n1. Extracting PDF text...")
-    pages = extract_text_from_pdf(pdf_path)
+def build_index(file_path, api_key: str | None = None):
+    """
+    Extract, chunk, embed, and store a document in ChromaDB.
+    Supports PDF (text + scanned), DOCX, PPTX, TXT, and images.
+    Pass api_key to enable Gemini Vision OCR for scanned/image files.
+    """
+    print("\n1. Extracting document text...")
+    pages = extract_text(file_path, api_key=api_key)
 
     print("2. Splitting text into sentence-aware chunks...")
     chunks = chunk_pages(pages)
 
     if not chunks:
-        raise ValueError("No text chunks were created.")
+        raise ValueError("No text chunks were created from this document.")
 
     print(f"   Pages:  {len(pages)}")
     print(f"   Chunks: {len(chunks)}")
@@ -67,13 +71,13 @@ def build_index(pdf_path):
             {
                 "page": chunk["page"],
                 "chunk_id": chunk["chunk_id"],
-                "source": Path(pdf_path).name,
+                "source": Path(file_path).name,
             }
             for chunk in chunks
         ],
     )
 
-    print(f"\nSUCCESS! Indexed {len(chunks)} chunks from {Path(pdf_path).name}.")
+    print(f"\nSUCCESS! Indexed {len(chunks)} chunks from {Path(file_path).name}.")
     return collection, model
 
 
@@ -167,9 +171,10 @@ def search_notes(query, collection, model, top_k=6):
 
 # ── CLI entry-point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import os
     default_pdf = ROOT_DIR / "data" / "dpco notes.pdf"
     entered_path = input(
-        f"Enter PDF path (press Enter for {default_pdf}): "
+        f"Enter file path (press Enter for {default_pdf}): "
     ).strip().strip('"')
 
     pdf_path = Path(entered_path) if entered_path else default_pdf
@@ -177,8 +182,9 @@ if __name__ == "__main__":
     if not pdf_path.is_absolute():
         pdf_path = ROOT_DIR / pdf_path
 
+    api_key = os.getenv("GEMINI_API_KEY")
     try:
-        collection, model = build_index(pdf_path)
+        collection, model = build_index(pdf_path, api_key=api_key)
 
         while True:
             query = input(
