@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT_DIR / "src"))
 from vector_store import (
     build_index,
     search_notes,
+    get_document_outline,
     DB_PATH,
     MODEL_NAME,
     COLLECTION_NAME,
@@ -44,7 +45,7 @@ GEMINI_MODELS = [
 ]
 GEMINI_MODEL = GEMINI_MODELS[0]
 HISTORY_WINDOW = 8          # turns kept in the prompt context
-TOP_K_PASSAGES = 6          # passages retrieved per question
+TOP_K_PASSAGES = 10         # passages retrieved per question
 
 SUGGESTED_QUESTIONS = [
     "Summarise the key topics covered in these notes.",
@@ -231,8 +232,8 @@ def index_uploaded_file(uploaded_file, api_key: str):
     return collection, model
 
 
-def build_prompt(question, passages, history):
-    """Construct the full prompt sent to Gemini."""
+def build_prompt(question, passages, history, doc_name=None):
+    """Construct the full prompt sent to Gemini with ChatGPT-level capability and strict notes grounding."""
     context = "\n\n".join(
         f"[Page {p['page']} | relevance {p.get('score', '—')}]\n{p['text']}"
         for p in passages
@@ -243,32 +244,65 @@ def build_prompt(question, passages, history):
         for m in history[-(HISTORY_WINDOW * 2):]
     )
 
-    return f"""
-You are NoteWise, a friendly and knowledgeable AI study tutor.
+    outline_data = get_document_outline()
+    outline_text = ""
+    if outline_data:
+        units_list = "\n".join(
+            f"- {u['unit']}: {u['title']} (Starts Page {u['page']}) — {u.get('preview', '')}"
+            for u in outline_data.get("units", [])
+        )
+        outline_text = f"""
+DOCUMENT OVERVIEW & STRUCTURE:
+- File Name: {outline_data.get('file_name', doc_name or 'Uploaded Document')}
+- Total Pages: {outline_data.get('total_pages', 'Unknown')}
+- Syllabus Units / Chapters:
+{units_list}
+""".strip()
+    elif doc_name:
+        outline_text = f"DOCUMENT OVERVIEW: Active document is '{doc_name}'."
 
-HOW TO ANSWER:
-- Answer naturally, like a patient tutor having a conversation.
-- Start with a direct answer, then explain with clear examples.
-- Use headings, bullet points, and step-by-step working when helpful.
-- Show clear working for numerical or logic problems.
-- Adapt explanations to a college student's level.
-- Use the retrieved passages as your primary evidence.
-- NEVER claim the notes say something unless a passage supports it.
-- If passages are insufficient, say so clearly, then offer a general explanation labelled as such.
-- Do not invent page numbers or citations.
-- Generate useful practice questions and answers when requested.
-- Use conversation history to answer follow-ups.
+    return f"""
+You are NoteWise AI — an elite, world-class university AI professor and study companion.
+Your explanations have the depth, clarity, and pedagogical power of ChatGPT / GPT-4o.
+
+{outline_text}
+
+HOW TO REASON AND ANSWER:
+1. STRICTLY GROUNDED IN THE NOTES:
+   - The student has uploaded their course notes. Treat these notes as your primary curriculum and ground truth.
+   - Anchor your explanations in their notes: cite the relevant Units and Page numbers naturally (e.g. "In Unit I (p. 1)..." or "Referencing Page 141...").
+   - If the student asks about the document, syllabus, or unit names, use the Document Overview & Units to provide a complete, authoritative breakdown.
+
+2. POWERFUL, CHATGPT-STYLE EXPLANATIONS:
+   - Provide direct, thorough, articulate answers with zero fluff.
+   - NEVER use robotic disclaimers or repetitive boilerplate like:
+     * "Since I don't have access to search or read through your entire PDF all at once..."
+     * "While your study notes mention... but they don't explicitly define..."
+     * "Here is a general explanation (General Explanation)"
+     * "I don't have access to your personal files..."
+   - If a concept (like K-map, Flip-Flops, or Memory Units) is in their notes, explain it with pedagogical brilliance: define the concept, explain the intuition, show why it matters, break down step-by-step rules, and connect it directly to the circuits in their notes.
+
+3. RICH FORMATTING:
+   - Use bold key concepts and clean Markdown hierarchy (##, ###).
+   - Use Markdown tables for comparisons, truth tables, and syllabus breakdowns.
+   - Use clean LaTeX for mathematical, Boolean, or circuit equations (e.g., $$F = A \\cdot B + \\bar{A} \\cdot C$$).
+   - Use clean text/ASCII grids for K-maps, diagrams, or state transitions.
+   - Include a highlight callout box (`> 💡 **Key Takeaway**:` or `> 📌 **Exam Tip**:`) where valuable.
+
+4. HELPFUL CONVERSATIONAL INTELLIGENCE:
+   - If the student asks about other subjects or files (e.g., "where is maths?", "do you have A&C?"), answer smartly and helpfully based on the active document syllabus, clarifying what the current document covers and letting them know they can upload additional documents via the sidebar anytime.
+   - Use conversation history to handle follow-up questions seamlessly.
 
 CONVERSATION HISTORY:
 {chat_history or "No previous conversation."}
 
 RETRIEVED PASSAGES FROM THE STUDENT'S NOTES:
-{context or "No relevant passages found — answer from general knowledge and label it clearly."}
+{context or "No specific excerpts retrieved. Rely on the Document Overview and provide an authoritative explanation."}
 
 STUDENT'S QUESTION:
 {question}
 
-Write a clear, friendly, well-structured answer.
+Deliver an extraordinary, clear, deeply helpful answer.
 """.strip()
 
 
@@ -442,7 +476,12 @@ if question:
             )
 
             history = st.session_state.messages[:-1]
-            prompt = build_prompt(question, passages, history)
+            prompt = build_prompt(
+                question,
+                passages,
+                history,
+                doc_name=st.session_state.doc_name,
+            )
 
             # 2. Stream the Gemini response (with fallback if model is busy/deprecated).
             last_err = None

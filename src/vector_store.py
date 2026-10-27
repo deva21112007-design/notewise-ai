@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -10,12 +11,89 @@ from chunker import chunk_pages
 # ── Project settings ────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = str(ROOT_DIR / "chroma_db")
+OUTLINE_FILE = ROOT_DIR / "chroma_db" / "document_outline.json"
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 COLLECTION_NAME = "notewise_notes"
 
 # Distance threshold: ChromaDB uses cosine distance (0 = identical).
 # Results with distance > this value are considered too weak to use.
 RELEVANCE_THRESHOLD = 0.65
+
+
+# ── Document Outline Extraction ──────────────────────────────────────────────
+def extract_document_outline(pages: list[dict], file_name: str) -> dict:
+    """
+    Scan pages to detect units, syllabus topics, and high-level structure.
+    Saves and returns a structured outline dictionary.
+    """
+    unit_regex = re.compile(
+        r"^\s*(UNIT\s*[-–:]?\s*(?:[I|V|X]+|\d+))\b\s*(.*)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    roman_conv = {
+        "UNIT1": "UNIT I", "UNIT2": "UNIT II", "UNIT3": "UNIT III",
+        "UNIT4": "UNIT IV", "UNIT5": "UNIT V",
+        "UNITI": "UNIT I", "UNITII": "UNIT II", "UNITIII": "UNIT III",
+        "UNITIV": "UNIT IV", "UNITV": "UNIT V",
+    }
+
+    outline_units = []
+    seen = set()
+
+    for p in pages:
+        lines = [l.strip() for l in p.get("text", "").split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            m = unit_regex.match(line)
+            if m:
+                u_tag = m.group(1).upper()
+                u_norm = re.sub(r"[^A-Z0-9]", "", u_tag)
+                canonical = roman_conv.get(u_norm, u_tag)
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
+
+                title = m.group(2).strip()
+                if not title and i + 1 < len(lines):
+                    title = lines[i + 1]
+                if len(title) > 80:
+                    title = title[:80]
+
+                sub = lines[i + 2] if i + 2 < len(lines) else ""
+                if len(sub) > 100:
+                    sub = sub[:100]
+
+                outline_units.append({
+                    "unit": canonical,
+                    "title": title or "Module",
+                    "preview": sub,
+                    "page": p["page"],
+                })
+
+    outline_data = {
+        "file_name": Path(file_name).name,
+        "total_pages": len(pages),
+        "units": outline_units,
+    }
+
+    try:
+        OUTLINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(OUTLINE_FILE, "w", encoding="utf-8") as f:
+            json.dump(outline_data, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save outline: {e}")
+
+    return outline_data
+
+
+def get_document_outline() -> dict | None:
+    """Retrieve saved document outline if it exists."""
+    if OUTLINE_FILE.exists():
+        try:
+            with open(OUTLINE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 
 # ── Indexing ─────────────────────────────────────────────────────────────────
@@ -25,10 +103,14 @@ def build_index(file_path, api_key: str | None = None):
     Supports PDF (text + scanned), DOCX, PPTX, TXT, and images.
     Pass api_key to enable Gemini Vision OCR for scanned/image files.
     """
-    print("\n1. Extracting document text...")
+    file_name = Path(file_path).name
+    print(f"\n1. Extracting document text from {file_name}...")
     pages = extract_text(file_path, api_key=api_key)
 
-    print("2. Splitting text into sentence-aware chunks...")
+    print("2. Extracting document outline & syllabus structure...")
+    extract_document_outline(pages, file_name)
+
+    print("3. Splitting text into sentence-aware chunks...")
     chunks = chunk_pages(pages)
 
     if not chunks:
@@ -37,10 +119,10 @@ def build_index(file_path, api_key: str | None = None):
     print(f"   Pages:  {len(pages)}")
     print(f"   Chunks: {len(chunks)}")
 
-    print("\n3. Loading the embedding model...")
+    print("\n4. Loading the embedding model...")
     model = SentenceTransformer(MODEL_NAME)
 
-    print("\n4. Creating embeddings...")
+    print("\n5. Creating embeddings...")
     texts = [chunk["text"] for chunk in chunks]
     embeddings = model.encode(
         texts,
@@ -48,7 +130,7 @@ def build_index(file_path, api_key: str | None = None):
         show_progress_bar=True,
     ).tolist()
 
-    print("\n5. Saving embeddings to ChromaDB...")
+    print("\n6. Saving embeddings to ChromaDB...")
     client = chromadb.PersistentClient(path=DB_PATH)
 
     # Rebuild the collection so rerunning this script
@@ -71,41 +153,78 @@ def build_index(file_path, api_key: str | None = None):
             {
                 "page": chunk["page"],
                 "chunk_id": chunk["chunk_id"],
-                "source": Path(file_path).name,
+                "source": file_name,
             }
             for chunk in chunks
         ],
     )
 
-    print(f"\nSUCCESS! Indexed {len(chunks)} chunks from {Path(file_path).name}.")
+    print(f"\nSUCCESS! Indexed {len(chunks)} chunks from {file_name}.")
     return collection, model
 
 
 # ── Retrieval ────────────────────────────────────────────────────────────────
-def search_notes(query, collection, model, top_k=6):
+def search_notes(query, collection, model, top_k=10):
     """
-    Retrieve the most relevant passages for a query.
-
-    Strategy:
-    1. If the query mentions a specific unit (e.g. "Unit I", "unit 3"),
-       first try a keyword match on the stored text so structured
-       curriculum content is always found.
-    2. Fall back to semantic (cosine) similarity search for everything else.
-    3. Filter out passages whose cosine distance exceeds RELEVANCE_THRESHOLD
-       to avoid hallucination from irrelevant context.
-
-    Returns a list of dicts: {text, page, source, score}.
+    Advanced Hybrid Retrieval:
+    1. Query normalization (handling apostrophes, e.g. k'map -> k-map, kmap).
+    2. Document Structure & Overview detection:
+       If the query asks about units, syllabus, chapters, topics, or index,
+       retrieve the Unit introduction chunks directly.
+    3. Specific Unit queries:
+       If the query targets a specific unit (e.g. Unit 3 / Unit III),
+       prioritize that unit's pages.
+    4. Keyword Boosting:
+       Exact match boosting for technical terms (e.g., k-map, flip-flop, adder).
+    5. Dense Semantic Search:
+       Cosine similarity using all-MiniLM-L6-v2 embeddings.
+    6. Fusion & Deduplication:
+       Merges and ranks the most informative passages.
     """
     count = collection.count()
     if count == 0:
         return []
 
-    # ── Step 1: Unit-keyword shortcut ────────────────────────────────────────
-    unit_match = re.search(
-        r"\bunit\s*(i{1,3}|iv|v|[1-5])\b",
-        query.lower(),
-    )
+    q_lower = query.lower()
+    # Normalize variants like k'map, k-map, kmap
+    q_normalized = q_lower.replace("'", "").replace("’", "")
+    terms = [w for w in re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", q_normalized)]
 
+    stored = None
+    passages_dict = {}  # key -> dict
+
+    def get_stored_data():
+        nonlocal stored
+        if stored is None:
+            stored = collection.get(include=["documents", "metadatas"])
+        return stored
+
+    # ── Strategy A: Overview / Unit-list detection ───────────────────────────
+    is_overview = any(term in q_lower for term in [
+        "unit name", "units in", "what units", "how many units", "list the units",
+        "what are the units", "all units", "syllabus", "table of contents",
+        "index", "chapters", "outline", "what does this note cover", "overview",
+        "topics covered", "how many chapters"
+    ])
+
+    if is_overview:
+        outline = get_document_outline()
+        unit_pages = {u["page"] for u in outline.get("units", [])} if outline else set()
+        data = get_stored_data()
+        for doc, meta in zip(data["documents"], data["metadatas"]):
+            p = meta.get("page", 1)
+            # Include detected unit pages or beginning pages
+            if p in unit_pages or p in {1, 2, 3}:
+                key = (meta.get("source", "Notes"), p, meta.get("chunk_id", 0))
+                passages_dict[key] = {
+                    "text": doc,
+                    "page": p,
+                    "source": meta.get("source", "Notes"),
+                    "score": 0.98,
+                }
+
+    # ── Strategy B: Specific Unit query ──────────────────────────────────────
+    unit_match = re.search(r"\bunit\s*(i{1,3}|iv|v|[1-5])\b", q_lower)
     if unit_match:
         unit_str = unit_match.group(1)
         roman_map = {
@@ -115,58 +234,82 @@ def search_notes(query, collection, model, top_k=6):
             "iv": (4, "IV"), "4": (4, "IV"),
             "v": (5, "V"), "5": (5, "V"),
         }
-        number, roman = roman_map[unit_str]
+        number, roman = roman_map.get(unit_str, (1, "I"))
+        pattern = re.compile(rf"\bUNIT\s*[-:]?\s*(?:{roman}|{number})\b", re.IGNORECASE)
+        data = get_stored_data()
+        for doc, meta in zip(data["documents"], data["metadatas"]):
+            if pattern.search(doc[:300]):
+                key = (meta.get("source", "Notes"), meta["page"], meta.get("chunk_id", 0))
+                passages_dict[key] = {
+                    "text": doc,
+                    "page": meta["page"],
+                    "source": meta.get("source", "Notes"),
+                    "score": 0.95,
+                }
 
-        stored = collection.get(include=["documents", "metadatas"])
-        pattern = re.compile(
-            rf"\bUNIT\s*[-:]?\s*(?:{roman}|{number})\b",
-            re.IGNORECASE,
+    # ── Strategy C: Key Technical Term Boost ─────────────────────────────────
+    tech_keywords = []
+    if "kmap" in q_normalized or "k map" in q_lower or "karnaugh" in q_lower:
+        tech_keywords.extend(["kmap", "k-map", "karnaugh"])
+    if "flip flop" in q_lower or "flip-flop" in q_lower:
+        tech_keywords.extend(["flip-flop", "flip flop"])
+    if "multiplexer" in q_lower or "mux" in q_lower:
+        tech_keywords.extend(["multiplexer", "mux"])
+
+    if tech_keywords:
+        data = get_stored_data()
+        for doc, meta in zip(data["documents"], data["metadatas"]):
+            doc_lower = doc.lower()
+            if any(tk in doc_lower for tk in tech_keywords):
+                key = (meta.get("source", "Notes"), meta["page"], meta.get("chunk_id", 0))
+                if key not in passages_dict:
+                    passages_dict[key] = {
+                        "text": doc,
+                        "page": meta["page"],
+                        "source": meta.get("source", "Notes"),
+                        "score": 0.88,
+                    }
+
+    # ── Strategy D: Dense Semantic Vector Search ─────────────────────────────
+    # Search with original query + normalized variant
+    query_variants = [query]
+    if "k'map" in query.lower() or "k map" in query.lower():
+        query_variants.append("Karnaugh Map K-map Boolean simplification logic diagram")
+
+    for q_var in query_variants:
+        embedding = model.encode([q_var]).tolist()
+        results = collection.query(
+            query_embeddings=embedding,
+            n_results=min(top_k * 2, count),
+            include=["documents", "metadatas", "distances"],
         )
 
-        keyword_passages = [
-            {
-                "text": doc,
-                "page": meta["page"],
-                "source": meta.get("source", "Notes"),
-                "score": 1.0,  # keyword hits treated as perfect match
-            }
-            for doc, meta in zip(stored["documents"], stored["metadatas"])
-            if pattern.search(doc[:300])
-        ]
+        for doc, meta, distance in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            similarity = 1.0 - distance
+            if distance > RELEVANCE_THRESHOLD:
+                continue
 
-        if keyword_passages:
-            return keyword_passages[:top_k]
+            key = (meta.get("source", "Notes"), meta["page"], meta.get("chunk_id", 0))
+            if key not in passages_dict or passages_dict[key]["score"] < similarity:
+                passages_dict[key] = {
+                    "text": doc,
+                    "page": meta["page"],
+                    "source": meta.get("source", "Notes"),
+                    "score": round(similarity, 3),
+                }
 
-    # ── Step 2: Semantic search ───────────────────────────────────────────────
-    embedding = model.encode([query]).tolist()
-
-    results = collection.query(
-        query_embeddings=embedding,
-        n_results=min(top_k, count),
-        include=["documents", "metadatas", "distances"],
+    # Sort all candidate passages by score descending
+    sorted_passages = sorted(
+        passages_dict.values(),
+        key=lambda x: x["score"],
+        reverse=True,
     )
 
-    passages = []
-    for doc, meta, distance in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0],
-    ):
-        # Convert cosine distance → similarity score (0–1, higher = better).
-        similarity = 1.0 - distance
-
-        # Skip passages that are too dissimilar to be useful.
-        if distance > RELEVANCE_THRESHOLD:
-            continue
-
-        passages.append({
-            "text": doc,
-            "page": meta["page"],
-            "source": meta.get("source", "Notes"),
-            "score": round(similarity, 3),
-        })
-
-    return passages
+    return sorted_passages[:top_k]
 
 
 # ── CLI entry-point ───────────────────────────────────────────────────────────
