@@ -36,8 +36,13 @@ from vector_store import (
     SUPPORTED_EXTENSIONS,
 )
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-GEMINI_MODEL = "gemini-3.8-flash"
+# Primary model with automatic failover if experiencing high demand (503) or not found (404)
+GEMINI_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite",
+]
+GEMINI_MODEL = GEMINI_MODELS[0]
 HISTORY_WINDOW = 8          # turns kept in the prompt context
 TOP_K_PASSAGES = 6          # passages retrieved per question
 
@@ -439,16 +444,27 @@ if question:
             history = st.session_state.messages[:-1]
             prompt = build_prompt(question, passages, history)
 
-            # 2. Stream the Gemini response.
-            stream = gemini.models.generate_content_stream(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
+            # 2. Stream the Gemini response (with fallback if model is busy/deprecated).
+            last_err = None
+            for model_name in GEMINI_MODELS:
+                try:
+                    full_answer = ""
+                    stream = gemini.models.generate_content_stream(
+                        model=model_name,
+                        contents=prompt,
+                    )
+                    for chunk in stream:
+                        if chunk.text:
+                            full_answer += chunk.text
+                            answer_placeholder.markdown(full_answer + "▌")
+                    last_err = None
+                    break
+                except Exception as model_err:
+                    last_err = model_err
+                    continue
 
-            for chunk in stream:
-                if chunk.text:
-                    full_answer += chunk.text
-                    answer_placeholder.markdown(full_answer + "▌")
+            if last_err is not None and not full_answer:
+                raise last_err
 
             answer_placeholder.markdown(full_answer)
 

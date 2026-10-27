@@ -54,24 +54,40 @@ def _render_page_as_png(doc, page_index: int, zoom: float = 2.0) -> bytes:
     return pix.tobytes("png")
 
 
+VISION_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite",
+]
+
+
 def _ocr_image_bytes(image_bytes: bytes, api_key: str, page_label: str = "page") -> str:
     """Send raw PNG/JPEG bytes to Gemini Vision and return extracted text."""
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-            types.Part.from_text(
-                "Extract ALL visible text from this image exactly as written. "
-                "Preserve headings, bullet points, tables, equations, and captions. "
-                "Do not add any commentary or explanation — only the text content."
-            ),
-        ],
-    )
-    return (response.text or "").strip()
+    last_err = None
+    for model_name in VISION_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                    types.Part.from_text(
+                        "Extract ALL visible text from this image exactly as written. "
+                        "Preserve headings, bullet points, tables, equations, and captions. "
+                        "Do not add any commentary or explanation — only the text content."
+                    ),
+                ],
+            )
+            return (response.text or "").strip()
+        except Exception as err:
+            last_err = err
+            continue
+    if last_err:
+        raise last_err
+    return ""
 
 
 def extract_text_from_pdf(pdf_path, api_key: str | None = None) -> list[dict]:
@@ -242,17 +258,28 @@ def extract_text_from_image(image_path, api_key: str) -> list[dict]:
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=[
-            types.Part.from_bytes(data=img_bytes, mime_type=mime_type),
-            types.Part.from_text(
-                "Extract ALL visible text from this image exactly as written. "
-                "Preserve headings, bullet points, tables, equations. "
-                "Return only the extracted text."
-            ),
-        ],
-    )
+    last_err = None
+    response = None
+    for model_name in VISION_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=img_bytes, mime_type=mime_type),
+                    types.Part.from_text(
+                        "Extract ALL visible text from this image exactly as written. "
+                        "Preserve headings, bullet points, tables, equations. "
+                        "Return only the extracted text."
+                    ),
+                ],
+            )
+            break
+        except Exception as err:
+            last_err = err
+            continue
+
+    if response is None and last_err:
+        raise last_err
 
     text = (response.text or "").strip()
     if not text:
