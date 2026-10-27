@@ -97,40 +97,69 @@ def get_document_outline() -> dict | None:
 
 
 # ── Indexing ─────────────────────────────────────────────────────────────────
-def build_index(file_path, api_key: str | None = None):
+def build_index(file_paths, api_key: str | None = None):
     """
-    Extract, chunk, embed, and store a document in ChromaDB.
-    Supports PDF (text + scanned), DOCX, PPTX, TXT, and images.
+    Extract, chunk, embed, and store one or multiple documents in ChromaDB.
+    Supports a single file path or a list of file paths: PDF, DOCX, PPTX, TXT, images.
     Pass api_key to enable Gemini Vision OCR for scanned/image files.
     """
-    file_name = Path(file_path).name
-    print(f"\n1. Extracting document text from {file_name}...")
-    pages = extract_text(file_path, api_key=api_key)
+    if isinstance(file_paths, (str, Path)):
+        file_paths = [Path(file_paths)]
+    else:
+        file_paths = [Path(fp) for fp in file_paths]
 
-    print("2. Extracting document outline & syllabus structure...")
-    extract_document_outline(pages, file_name)
+    all_chunks = []
+    all_outlines = []
+    total_pages_count = 0
 
-    print("3. Splitting text into sentence-aware chunks...")
-    chunks = chunk_pages(pages)
+    for fp in file_paths:
+        file_name = fp.name
+        print(f"\n1. Extracting document text from {file_name}...")
+        pages = extract_text(fp, api_key=api_key)
+        total_pages_count += len(pages)
 
-    if not chunks:
-        raise ValueError("No text chunks were created from this document.")
+        # Extract outline
+        outline = extract_document_outline(pages, file_name)
+        all_outlines.append(outline)
 
-    print(f"   Pages:  {len(pages)}")
-    print(f"   Chunks: {len(chunks)}")
+        # Chunk pages and tag source
+        file_chunks = chunk_pages(pages)
+        for c in file_chunks:
+            c["source"] = file_name
+        all_chunks.extend(file_chunks)
 
-    print("\n4. Loading the embedding model...")
+    # Save combined outline if multiple documents
+    if len(all_outlines) > 1:
+        combined_outline = {
+            "files": [o["file_name"] for o in all_outlines],
+            "total_files": len(all_outlines),
+            "total_pages": total_pages_count,
+            "documents": all_outlines,
+        }
+        try:
+            with open(OUTLINE_FILE, "w", encoding="utf-8") as f:
+                json.dump(combined_outline, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save multi-file outline: {e}")
+
+    if not all_chunks:
+        raise ValueError("No text chunks were created from the uploaded document(s).")
+
+    print(f"\nTotal Pages across all files: {total_pages_count}")
+    print(f"Total Chunks across all files: {len(all_chunks)}")
+
+    print("\nLoading the embedding model...")
     model = SentenceTransformer(MODEL_NAME)
 
-    print("\n5. Creating embeddings...")
-    texts = [chunk["text"] for chunk in chunks]
+    print("\nCreating embeddings...")
+    texts = [chunk["text"] for chunk in all_chunks]
     embeddings = model.encode(
         texts,
         batch_size=32,
         show_progress_bar=True,
     ).tolist()
 
-    print("\n6. Saving embeddings to ChromaDB...")
+    print("\nSaving embeddings to ChromaDB...")
     client = chromadb.PersistentClient(path=DB_PATH)
 
     # Rebuild the collection so rerunning this script
@@ -146,20 +175,21 @@ def build_index(file_path, api_key: str | None = None):
     )
 
     collection.add(
-        ids=[f"chunk-{chunk['chunk_id']}" for chunk in chunks],
+        ids=[f"chunk-{i}" for i in range(len(all_chunks))],
         documents=texts,
         embeddings=embeddings,
         metadatas=[
             {
                 "page": chunk["page"],
-                "chunk_id": chunk["chunk_id"],
-                "source": file_name,
+                "chunk_id": chunk.get("chunk_id", i),
+                "source": chunk.get("source", "Notes"),
             }
-            for chunk in chunks
+            for i, chunk in enumerate(all_chunks)
         ],
     )
 
-    print(f"\nSUCCESS! Indexed {len(chunks)} chunks from {file_name}.")
+    names_str = ", ".join(fp.name for fp in file_paths)
+    print(f"\nSUCCESS! Indexed {len(all_chunks)} chunks from {len(file_paths)} file(s): {names_str}.")
     return collection, model
 
 
@@ -209,7 +239,13 @@ def search_notes(query, collection, model, top_k=10):
 
     if is_overview:
         outline = get_document_outline()
-        unit_pages = {u["page"] for u in outline.get("units", [])} if outline else set()
+        unit_pages = set()
+        if outline:
+            if "documents" in outline:
+                for d in outline["documents"]:
+                    unit_pages.update({u["page"] for u in d.get("units", [])})
+            else:
+                unit_pages.update({u["page"] for u in outline.get("units", [])})
         data = get_stored_data()
         for doc, meta in zip(data["documents"], data["metadatas"]):
             p = meta.get("page", 1)

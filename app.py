@@ -176,6 +176,19 @@ st.markdown(
         border: 1px dashed rgba(167, 139, 250, 0.4);
     }
 
+    .file-badge {
+        display: flex;
+        align-items: center;
+        background: rgba(167, 139, 250, 0.12);
+        border: 1px solid rgba(167, 139, 250, 0.28);
+        border-radius: 8px;
+        padding: 5px 10px;
+        margin-bottom: 6px;
+        font-size: 0.8rem;
+        color: #ddd6fe;
+        word-break: break-all;
+    }
+
     /* ── Dividers ── */
     hr { border-color: rgba(255,255,255,0.08) !important; }
 
@@ -209,24 +222,29 @@ def load_existing_index():
     return collection, model
 
 
-def index_uploaded_file(uploaded_file, api_key: str):
-    """Save the upload to disk, run build_index (with OCR if needed), return (collection, model)."""
+def index_uploaded_files(uploaded_files, api_key: str):
+    """Save all uploads to disk, run build_index across all of them, return (collection, model)."""
     data_dir = ROOT_DIR / "data"
     data_dir.mkdir(exist_ok=True)
 
-    dest_path = data_dir / uploaded_file.name
-    dest_path.write_bytes(uploaded_file.getbuffer())
+    dest_paths = []
+    has_images = False
+    for up_file in uploaded_files:
+        dest_path = data_dir / up_file.name
+        dest_path.write_bytes(up_file.getbuffer())
+        dest_paths.append(dest_path)
+        if dest_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+            has_images = True
 
-    ext = dest_path.suffix.lower()
-    is_image_or_scan = ext in {".png", ".jpg", ".jpeg", ".webp"}
+    n_files = len(dest_paths)
     spinner_msg = (
-        "⚙️ Running OCR on your document — this may take 1–2 minutes..."
-        if is_image_or_scan
-        else "⚙️ Indexing your document — this takes ~30 seconds..."
+        f"⚙️ Running OCR and indexing {n_files} document(s)..."
+        if has_images
+        else f"⚙️ Indexing {n_files} document(s) — this takes ~30 seconds..."
     )
 
     with st.spinner(spinner_msg):
-        collection, model = build_index(dest_path, api_key=api_key)
+        collection, model = build_index(dest_paths, api_key=api_key)
 
     load_existing_index.clear()
     return collection, model
@@ -247,11 +265,26 @@ def build_prompt(question, passages, history, doc_name=None):
     outline_data = get_document_outline()
     outline_text = ""
     if outline_data:
-        units_list = "\n".join(
-            f"- {u['unit']}: {u['title']} (Starts Page {u['page']}) — {u.get('preview', '')}"
-            for u in outline_data.get("units", [])
-        )
-        outline_text = f"""
+        if "documents" in outline_data:
+            doc_summaries = []
+            for doc_info in outline_data["documents"]:
+                fname = doc_info.get("file_name", "Document")
+                pcount = doc_info.get("total_pages", "?")
+                units_str = ", ".join(
+                    f"{u['unit']}: {u['title']}" for u in doc_info.get("units", [])
+                ) or "General Notes"
+                doc_summaries.append(f"- **{fname}** ({pcount} pages): {units_str}")
+            docs_block = "\n".join(doc_summaries)
+            outline_text = f"""
+DOCUMENT OVERVIEW & STRUCTURE ({outline_data.get('total_files', len(outline_data['documents']))} active files):
+{docs_block}
+""".strip()
+        else:
+            units_list = "\n".join(
+                f"- {u['unit']}: {u['title']} (Starts Page {u['page']}) — {u.get('preview', '')}"
+                for u in outline_data.get("units", [])
+            )
+            outline_text = f"""
 DOCUMENT OVERVIEW & STRUCTURE:
 - File Name: {outline_data.get('file_name', doc_name or 'Uploaded Document')}
 - Total Pages: {outline_data.get('total_pages', 'Unknown')}
@@ -259,7 +292,7 @@ DOCUMENT OVERVIEW & STRUCTURE:
 {units_list}
 """.strip()
     elif doc_name:
-        outline_text = f"DOCUMENT OVERVIEW: Active document is '{doc_name}'."
+        outline_text = f"DOCUMENT OVERVIEW: Active document(s): '{doc_name}'."
 
     return f"""
 You are NoteWise AI — an elite, world-class university AI professor and study companion.
@@ -336,8 +369,8 @@ if "collection" not in st.session_state:
     st.session_state.collection = None
 if "embed_model" not in st.session_state:
     st.session_state.embed_model = None
-if "doc_name" not in st.session_state:
-    st.session_state.doc_name = None
+if "doc_names" not in st.session_state:
+    st.session_state.doc_names = []
 
 
 # ── API key check ─────────────────────────────────────────────────────────────
@@ -362,26 +395,28 @@ with st.sidebar:
     st.markdown("### 📄 Upload Your Notes")
 
     accepted_types = ["pdf", "docx", "pptx", "txt", "png", "jpg", "jpeg", "webp"]
-    uploaded = st.file_uploader(
-        "Drop a file here",
+    uploaded_files = st.file_uploader(
+        "Drop files here",
         type=accepted_types,
-        help="Supports PDF (text & scanned), Word, PowerPoint, TXT, and images. Scanned PDFs are read using Gemini Vision OCR.",
+        accept_multiple_files=True,
+        help="Upload one or multiple files: PDF (text & scanned), Word, PowerPoint, TXT, and images.",
         label_visibility="collapsed",
     )
-    st.caption("📎 PDF · DOCX · PPTX · TXT · PNG · JPG · WEBP")
+    st.caption("📎 PDF · DOCX · PPTX · TXT · PNG · JPG · WEBP · Multiple files")
 
-    if uploaded:
-        if uploaded.name != st.session_state.doc_name:
+    if uploaded_files:
+        current_names = sorted([f.name for f in uploaded_files])
+        if current_names != st.session_state.doc_names:
             try:
-                col, mdl = index_uploaded_file(uploaded, api_key=api_key)
+                col, mdl = index_uploaded_files(uploaded_files, api_key=api_key)
                 st.session_state.collection = col
                 st.session_state.embed_model = mdl
-                st.session_state.doc_name = uploaded.name
+                st.session_state.doc_names = current_names
                 st.session_state.messages = []
-                st.success(f"✅ Indexed **{uploaded.name}**")
+                st.success(f"✅ Indexed {len(uploaded_files)} document(s)!")
                 st.rerun()
             except Exception as e:
-                st.error(f"Failed to index file: {e}")
+                st.error(f"Failed to index files: {e}")
 
     # ── Try loading pre-built index if no upload yet ──
     if st.session_state.collection is None:
@@ -389,7 +424,7 @@ with st.sidebar:
             col, mdl = load_existing_index()
             st.session_state.collection = col
             st.session_state.embed_model = mdl
-            st.session_state.doc_name = "DPCO Notes (pre-loaded)"
+            st.session_state.doc_names = ["dpco notes.pdf"]
         except Exception:
             pass
 
@@ -402,11 +437,13 @@ with st.sidebar:
         col1.metric("📦 Chunks", chunk_count)
         col2.metric("💬 Messages", len(st.session_state.messages))
 
-        st.markdown(
-            f"**Active document:**  \n`{st.session_state.doc_name}`",
-        )
+        docs = st.session_state.doc_names
+        if docs:
+            st.markdown(f"**Active documents ({len(docs)}):**")
+            for dname in docs:
+                st.markdown(f'<div class="file-badge">📄 {dname}</div>', unsafe_allow_html=True)
     else:
-        st.info("Upload a PDF to get started.")
+        st.info("Upload notes to get started.")
 
     st.markdown("---")
 
@@ -480,7 +517,7 @@ if question:
                 question,
                 passages,
                 history,
-                doc_name=st.session_state.doc_name,
+                doc_name=", ".join(st.session_state.doc_names),
             )
 
             # 2. Stream the Gemini response (with fallback if model is busy/deprecated).
